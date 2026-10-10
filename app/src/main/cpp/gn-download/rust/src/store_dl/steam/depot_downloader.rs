@@ -677,12 +677,22 @@ cannot be enumerated for ownership",
             .as_ref()
             .map(|p| crate::store_dl::steam::depot_writer::unchanged_files(p, &manifest))
             .unwrap_or_default();
+        let mut trusted_chunks = previous
+            .as_ref()
+            .map(|p| crate::store_dl::steam::depot_writer::unchanged_chunks(p, &manifest))
+            .unwrap_or_default();
         // ...unless the app patched one of them: those bytes are NOT the previous manifest's, so
         // they are revalidated and rewritten like any other change (see `untrusted`).
         if !untrusted.is_empty() {
             let before = trusted.len();
             trusted.retain(|index| {
                 let file = &manifest.files[*index as usize];
+                !untrusted.contains(&crate::store_dl::steam::depot_writer::folded_entry_key(
+                    &file.filename,
+                ))
+            });
+            trusted_chunks.retain(|(file_idx, _)| {
+                let file = &manifest.files[*file_idx as usize];
                 !untrusted.contains(&crate::store_dl::steam::depot_writer::folded_entry_key(
                     &file.filename,
                 ))
@@ -697,6 +707,10 @@ revalidated (DRM backup present)",
                 }
             }
         }
+        if !trusted.is_empty() && !trusted_chunks.is_empty() {
+            let whole: HashSet<u32> = trusted.iter().copied().collect();
+            trusted_chunks.retain(|(file_idx, _)| !whole.contains(file_idx));
+        }
         // Depots share one install dir, so a path this depot dropped may still belong to another
         // depot: `protected` (built before the loop from the manifests of this run) holds every path
         // any of them installs, and the sweep skips those. A depot recorded as installed that this
@@ -708,11 +722,13 @@ revalidated (DRM backup present)",
             Some(p) => {
                 if let Some(log) = log {
                     log(&format!(
-                        "depot-delta depot={depot_id} unchanged={}/{} changed={} removed={}",
+                        "depot-delta depot={depot_id} unchanged={}/{} changed={} removed={} \
+chunks_trusted={}",
                         trusted.len(),
                         manifest.files.len(),
                         manifest.files.len() - trusted.len(),
                         crate::store_dl::steam::depot_writer::removed_files(p, &manifest).len(),
+                        trusted_chunks.len(),
                     ));
                 }
             }
@@ -789,6 +805,7 @@ revalidated (DRM backup present)",
                 // no finalize. Empty for a fresh install / verify / when the previous manifest is
                 // unknown, which leaves the classic full-walk behaviour.
                 trusted_files: Some(&trusted),
+                trusted_chunks: Some(&trusted_chunks),
                 ..Default::default()
             },
         );
@@ -1199,6 +1216,81 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn update_trusts_the_unchanged_chunks_of_a_changed_file() {
+        let dir = temp_dir("update_trusts_unchanged_chunks");
+        let config_dir = config_dir_path(&dir);
+        fs::create_dir_all(&config_dir).unwrap();
+        let kept_crc = crate::store_dl::steam::depot_writer::depot_adler_hash(b"kept_");
+        let fresh_crc = crate::store_dl::steam::depot_writer::depot_adler_hash(b"fresh");
+        fs::write(
+            config_dir.join("100_111.manifest"),
+            raw_manifest_entry_with_chunks(
+                100,
+                111,
+                "data.bin",
+                10,
+                Some(&[1u8; 20]),
+                &[(0, &[7u8; 20], kept_crc, 5), (5, &[8u8; 20], 0, 5)],
+            ),
+        )
+        .unwrap();
+        fs::write(
+            config_dir.join("100_222.manifest"),
+            raw_manifest_entry_with_chunks(
+                100,
+                222,
+                "data.bin",
+                10,
+                Some(&[2u8; 20]),
+                &[(0, &[7u8; 20], kept_crc, 5), (5, &[9u8; 20], fresh_crc, 5)],
+            ),
+        )
+        .unwrap();
+        // The trusted first chunk is deliberately wrong on disk: it is never re-hashed, so it is
+        // neither fetched (there is no CDN here) nor rewritten. The second chunk already matches.
+        fs::write(dir.join("data.bin"), b"WRONGfresh").unwrap();
+        assert!(DepotConfigStore::load(&config_dir).finish_depot(100, 111));
+
+        let lines: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let logger = |line: &str| lines.lock().unwrap().push(line.to_string());
+        let result = download_resolved_depots_with_cancel_progress(
+            dir.to_str().unwrap(),
+            &[ResolvedDepotSpec {
+                depot_id: 100,
+                manifest_id: 222,
+                depot_key: vec![1u8; 32],
+                manifest_request_code: 0,
+            }],
+            &[CContentServerDirectoryServerInfo {
+                host: "cdn.example".into(),
+                https_support: "mandatory".into(),
+                ..Default::default()
+            }],
+            "",
+            true,
+            &[],
+            4,
+            4,
+            None,
+            None,
+            None,
+            None,
+            Some(&logger),
+            None,
+        );
+
+        let logged = lines.lock().unwrap().join("\n");
+        assert!(result.success, "{}", result.error);
+        assert!(
+            logged.contains("depot-delta depot=100 unchanged=0/1 changed=1 removed=0 chunks_trusted=1"),
+            "the unchanged chunk of the changed file was not trusted: {logged}"
+        );
+        assert_eq!(fs::read(dir.join("data.bin")).unwrap(), b"WRONGfresh");
+        assert!(DepotConfigStore::load(&config_dir).is_installed(100, 222));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A DRM-patched file (a Steamless-unpacked exe, a replaced steam_api*.dll) has a backup sibling
     /// on disk, so its bytes are NOT the previous manifest's even though path, size and hash all
     /// match. The delta must revalidate it, otherwise the patch survives an update forever and the
@@ -1376,6 +1468,18 @@ mod tests {
         size: u64,
         sha_content: Option<&[u8]>,
     ) -> Vec<u8> {
+        raw_manifest_entry_with_chunks(depot_id, manifest_id, filename, size, sha_content, &[])
+    }
+
+    /// [`raw_manifest_entry`] plus chunk entries as `(offset, sha, crc, cb_original)`.
+    fn raw_manifest_entry_with_chunks(
+        depot_id: u32,
+        manifest_id: u64,
+        filename: &str,
+        size: u64,
+        sha_content: Option<&[u8]>,
+        chunks: &[(u64, &[u8], u32, u32)],
+    ) -> Vec<u8> {
         let mut file_body = Vec::new();
         {
             let mut writer = Writer::new(&mut file_body);
@@ -1383,6 +1487,18 @@ mod tests {
             writer.uint64_field(2, size);
             if let Some(sha) = sha_content {
                 writer.bytes_field(5, sha);
+            }
+            for &(offset, sha, crc, cb_original) in chunks {
+                let mut chunk_body = Vec::new();
+                {
+                    let mut chunk_writer = Writer::new(&mut chunk_body);
+                    chunk_writer.bytes_field(1, sha);
+                    chunk_writer.fixed32_field(2, crc);
+                    chunk_writer.uint64_field(3, offset);
+                    chunk_writer.uint32_field(4, cb_original);
+                    chunk_writer.uint32_field(5, cb_original);
+                }
+                writer.submessage_field(6, &chunk_body);
             }
         }
 
